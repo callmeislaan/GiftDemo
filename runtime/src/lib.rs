@@ -278,6 +278,9 @@ impl pallet_template::Config for Runtime {
 
 impl pallet_brands::Config for Runtime {
 	type Event = Event;
+	type BrandSymbolLimit = ConstU32<125>;
+	type BrandNameLimit = ConstU32<255>;
+	type BrandLimit = ConstU32<{u32::MAX}>;
 }
 
 impl pallet_customers::Config for Runtime {
