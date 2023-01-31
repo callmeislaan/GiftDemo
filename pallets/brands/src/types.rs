@@ -7,6 +7,10 @@ pub type BrandSymbolType<T> = BoundedVec<u8, <T as Config>::BrandSymbolLimit>;
 
 pub type BrandNameType<T> = BoundedVec<u8, <T as Config>::BrandNameLimit>;
 
+
+// brand need more than basic data like avatar image and description, video.
+// storage on ipfs, substrate just storage object hash.
+
 #[derive(Clone, Encode, Decode, MaxEncodedLen, TypeInfo)]
 #[scale_info(skip_type_params(T))]
 pub struct Brand<T: Config> {

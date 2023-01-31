@@ -4,6 +4,7 @@ members = [
     "pallets/template",
     "pallets/brands",
     "pallets/customers",
+    "pallets/data",
     "runtime",
 ]
 [profile.release]

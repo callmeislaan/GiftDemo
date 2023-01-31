@@ -16,12 +16,13 @@ use sp_runtime::{
 	create_runtime_str, generic, impl_opaque_keys,
 	traits::{AccountIdLookup, BlakeTwo256, Block as BlockT, IdentifyAccount, NumberFor, Verify},
 	transaction_validity::{TransactionSource, TransactionValidity},
-	ApplyExtrinsicResult, MultiSignature,
+	ApplyExtrinsicResult, MultiSignature, SaturatedConversion,
 };
 use sp_std::prelude::*;
 #[cfg(feature = "std")]
 use sp_version::NativeVersion;
 use sp_version::RuntimeVersion;
+use codec::Encode;
 
 // A few exports that help ease life for downstream crates.
 pub use frame_support::{
@@ -51,6 +52,8 @@ pub use pallet_brands;
 
 /// Import the customers pallet
 pub use pallet_customers;
+
+pub use pallet_data;
 
 /// An index to a block.
 pub type BlockNumber = u32;
@@ -280,11 +283,68 @@ impl pallet_brands::Config for Runtime {
 	type Event = Event;
 	type BrandSymbolLimit = ConstU32<125>;
 	type BrandNameLimit = ConstU32<255>;
-	type BrandLimit = ConstU32<{u32::MAX}>;
+	type BrandLimit = ConstU32<{ u32::MAX }>;
 }
 
 impl pallet_customers::Config for Runtime {
 	type Event = Event;
+}
+
+impl pallet_data::Config for Runtime {
+	type Event = Event;
+	type PeerIdLimit = ConstU32<{ u32::MAX }>;
+	type AuthorityId = pallet_data::crypto::DataNodeManagementAuthId;
+	type Call = Call;
+}
+
+impl<LocalCall> frame_system::offchain::CreateSignedTransaction<LocalCall> for Runtime
+where
+	Call: From<LocalCall>,
+{
+	fn create_transaction<C: frame_system::offchain::AppCrypto<Self::Public, Self::Signature>>(
+		call: Call,
+		public: <Signature as sp_runtime::traits::Verify>::Signer,
+		account: AccountId,
+		index: Index,
+	) -> Option<(Call, <UncheckedExtrinsic as sp_runtime::traits::Extrinsic>::SignaturePayload)> {
+		let period = BlockHashCount::get() as u64;
+		let current_block = System::block_number().saturated_into::<u64>().saturating_sub(1);
+		let tip = 0;
+		let extra: SignedExtra = (
+			frame_system::CheckNonZeroSender::<Runtime>::new(),
+			frame_system::CheckSpecVersion::<Runtime>::new(),
+			frame_system::CheckTxVersion::<Runtime>::new(),
+			frame_system::CheckGenesis::<Runtime>::new(),
+			frame_system::CheckEra::<Runtime>::from(generic::Era::mortal(period, current_block)),
+			frame_system::CheckNonce::<Runtime>::from(index),
+			frame_system::CheckWeight::<Runtime>::new(),
+			pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(tip),
+		);
+
+
+		let raw_payload = SignedPayload::new(call, extra)
+			.map_err(|e| {
+				log::warn!("Unable to create signed payload: {:?}", e);
+			})
+			.ok()?;
+		let signature = raw_payload.using_encoded(|payload| C::sign(payload, public))?;
+		let address = account;
+		let (call, extra, _) = raw_payload.deconstruct();
+		Some((call, (sp_runtime::MultiAddress::Id(address), signature.into(), extra)))
+	}
+}
+
+impl frame_system::offchain::SigningTypes for Runtime {
+	type Public = <Signature as sp_runtime::traits::Verify>::Signer;
+	type Signature = Signature;
+}
+
+impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
+where
+	Call: From<C>,
+{
+	type OverarchingCall = Call;
+	type Extrinsic = UncheckedExtrinsic;
 }
 
 // Create the runtime by composing the FRAME pallets that were previously configured.
@@ -306,6 +366,7 @@ construct_runtime!(
 		TemplateModule: pallet_template,
 		PalletBrands: pallet_brands,
 		PalletCustomers: pallet_customers,
+		PalletData: pallet_data,
 	}
 );
 
