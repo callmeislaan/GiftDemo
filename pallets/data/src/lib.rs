@@ -12,14 +12,19 @@ pub mod pallet {
 
 	use frame_support::inherent::Vec;
 	use frame_support::pallet_prelude::{OptionQuery, *};
+	use frame_support::unsigned::TransactionValidity;
 	use frame_support::{ensure, Blake2_128Concat, BoundedVec};
+	use frame_system as system;
 	use frame_system::offchain::{
-		AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer,
+		AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer, SubmitTransaction,
 	};
 	use frame_system::pallet_prelude::*;
 	use serde_json::Deserializer;
 	use sp_core::crypto::KeyTypeId;
 	use sp_runtime::offchain::{http, Duration};
+	use sp_runtime::transaction_validity::{
+		InvalidTransaction, TransactionPriority, TransactionSource, ValidTransaction,
+	};
 
 	/// Defines application identifier for crypto keys of this module.
 	///
@@ -64,6 +69,15 @@ pub mod pallet {
 	pub type PeerAccount<T: Config> =
 		StorageMap<_, Blake2_128Concat, DataPeer<T>, T::AccountId, OptionQuery>;
 
+	/// Defines the block when next unsigned transaction will be accepted.
+	///
+	/// To prevent spam of unsigned (and unpayed!) transactions on the network,
+	/// we only allow one transaction every `T::UnsignedInterval` blocks.
+	/// This storage entry defines when new transaction is going to be accepted.
+	#[pallet::storage]
+	#[pallet::getter(fn next_unsigned_at)]
+	pub(super) type NextUnsignedAt<T: Config> = StorageValue<_, T::BlockNumber, ValueQuery>;
+
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
@@ -83,13 +97,39 @@ pub mod pallet {
 		NeedRegister,
 		OffchainSignedTxError,
 		NoLocalAcctForSigning,
+		OffchainUnsignedTxError,
 	}
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn offchain_worker(block_number: T::BlockNumber) {
 			log::info!("Hello from pallet-ocw.");
-			Self::offchain_signed_tx(block_number);
+			Self::offchain_unsigned_tx(block_number);
+		}
+	}
+
+	#[pallet::validate_unsigned]
+	impl<T: Config> ValidateUnsigned for Pallet<T> {
+		type Call = Call<T>;
+
+		/// Validate unsigned call to this module.
+		///
+		/// By default unsigned transactions are disallowed, but implementing the validator
+		/// here we make sure that some particular calls (the ones produced by offchain worker)
+		/// are being whitelisted and marked as valid.
+		fn validate_unsigned(source: TransactionSource, call: &Self::Call) -> TransactionValidity {
+			// ensure transaction come from local
+
+			log::info!("Data source: {:?}", source);
+			ensure!(source != TransactionSource::External, {
+				InvalidTransaction::Custom(3)
+			});
+
+			if let Call::remove_data_peer_unsigned { block_number, peers_id } = call {
+				Self::validate_transaction_parameters(block_number, peers_id)
+			} else {
+				InvalidTransaction::Call.into()
+			}
 		}
 	}
 
@@ -163,11 +203,43 @@ pub mod pallet {
 
 			Ok(())
 		}
+
+		#[pallet::weight(0)]
+		pub fn remove_data_peer_unsigned(
+			origin: OriginFor<T>,
+			_block_number: T::BlockNumber,
+			peers_id: Vec<Vec<u8>>,
+		) -> DispatchResult {
+			let _ = ensure_none(origin)?;
+
+			log::info!("Remove unsiged data");
+
+			for peer_id in peers_id {
+				let bounded_peer_id: DataPeer<T> =
+					peer_id.clone().try_into().expect("peer id is too long");
+				// if let Some(bounded_peer_id) = bounded_peer_id_wrap {
+				if <PeerAccount<T>>::contains_key(bounded_peer_id.clone()) {
+					if let Some(account_id) = Self::peer_account(&bounded_peer_id) {
+						<AccountPeer<T>>::remove(account_id);
+					}
+
+					<PeerAccount<T>>::remove(bounded_peer_id.clone());
+					Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_peer_id));
+				}
+				// }
+			}
+
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {
-		fn offchain_signed_tx(block_number: T::BlockNumber) -> Result<(), Error<T>> {
+		fn offchain_signed_tx() -> Result<(), Error<T>> {
 			let peers_id = Self::fetch_peers_n_remove();
+
+			if peers_id.len() <= 0 {
+				return Ok(());
+			}
 
 			// We retrieve a signer and check if it is valid.
 			//   Since this pallet only has one key in the keystore. We use `any_account()1 to
@@ -198,6 +270,23 @@ pub mod pallet {
 			// The case of `None`: no account is available for sending
 			log::error!("No local account available");
 			Err(<Error<T>>::NoLocalAcctForSigning)
+		}
+
+		fn offchain_unsigned_tx(block_number: T::BlockNumber) -> Result<(), Error<T>> {
+			let peers_id = Self::fetch_peers_n_remove();
+
+			if peers_id.len() <= 0 {
+				return Ok(());
+			}
+
+			let call = Call::remove_data_peer_unsigned { block_number, peers_id: peers_id.clone() };
+
+			SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into()).map_err(
+				|_| {
+					log::error!("Failed in offchain_unsigned_tx");
+					<Error<T>>::OffchainUnsignedTxError
+				},
+			)
 		}
 
 		pub fn fetch_peers_n_remove() -> Vec<Vec<u8>> {
@@ -250,6 +339,48 @@ pub mod pallet {
 			ensure!(response.code == 200, <Error<T>>::HttpFetchingError);
 
 			Ok(response.body().collect::<Vec<u8>>())
+		}
+
+		fn validate_transaction_parameters(
+			block_number: &T::BlockNumber,
+			peers_id: &Vec<Vec<u8>>,
+		) -> TransactionValidity {
+
+			log::info!("Validate transaction parameters");
+
+			// Now let's check if the transaction has any chance to succeed.
+			let next_unsigned_at = <NextUnsignedAt<T>>::get();
+			if &next_unsigned_at > block_number {
+				return InvalidTransaction::Stale.into();
+			}
+			// Let's make sure to reject transactions from the future.
+			let current_block = <system::Pallet<T>>::block_number();
+			if &current_block < block_number {
+				return InvalidTransaction::Future.into();
+			}
+
+			ValidTransaction::with_tag_prefix("ExampleOffchainWorker")
+				.priority(TransactionPriority::max_value())
+				// This transaction does not require anything else to go before into the pool.
+				// In theory we could require `previous_unsigned_at` transaction to go first,
+				// but it's not necessary in our case.
+				//.and_requires()
+				// We set the `provides` tag to be the same as `next_unsigned_at`. This makes
+				// sure only one transaction produced after `next_unsigned_at` will ever
+				// get to the transaction pool and will end up in the block.
+				// We can still have multiple transactions compete for the same "spot",
+				// and the one with higher priority will replace other one in the pool.
+				.and_provides(next_unsigned_at)
+				// The transaction is only valid for next 5 blocks. After that it's
+				// going to be revalidated by the pool.
+				.longevity(5)
+				// It's fine to propagate that transaction to other peers, which means it can be
+				// created even by nodes that don't produce blocks.
+				// Note that sometimes it's better to keep it for yourself (if you are the block
+				// producer), since for instance in some schemes others may copy your solution and
+				// claim a reward.
+				.propagate(true)
+				.build()
 		}
 	}
 }
