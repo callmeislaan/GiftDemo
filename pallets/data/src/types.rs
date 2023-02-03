@@ -44,6 +44,20 @@ impl core::fmt::Debug for PeerInfoParameters {
 		.finish()
 	}
 }
+#[derive(Encode, Decode, Deserialize, Clone, TypeInfo, PartialEq, Eq)]
+pub struct UpdatablePeerInfoParameters {
+	pub cluster_public_address: Option<Vec<u8>>,
+	pub ipfs_public_address: Option<Vec<u8>>,
+}
+
+impl core::fmt::Debug for UpdatablePeerInfoParameters {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("UpdatablePeerInfoParameters")
+		.field("cluster_public_address", &self.cluster_public_address)
+		.field("ipfs_public_address", &self.ipfs_public_address)
+		.finish()
+	}
+}
 
 #[derive(Encode, Decode, Debug, Deserialize, Clone)]
 pub struct Peer {

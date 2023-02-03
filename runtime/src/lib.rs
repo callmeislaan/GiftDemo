@@ -296,6 +296,8 @@ impl pallet_data::Config for Runtime {
 	type AuthorityId = pallet_data::crypto::DataNodeManagementAuthId;
 	type Call = Call;
 	type TrustedPeerLimit = ConstU32<3_u32>;
+	type CandidatePeerLimit = ConstU32<10_u32>;
+	type PeerLimit = ConstU32<5_u32>;
 }
 
 impl<LocalCall> frame_system::offchain::CreateSignedTransaction<LocalCall> for Runtime

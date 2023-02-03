@@ -35,13 +35,9 @@ pub mod pallet {
 	/// The keys can be inserted manually via RPC (see `author_insertKey`).
 	pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"data");
 
-	const UNSIGNED_TXS_PRIORITY: u64 = 100;
 	const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
-	const LOCK_TIMEOUT_EXPIRATION: u64 = FETCH_TIMEOUT_PERIOD + 1000; // in milli-seconds
-	const LOCK_BLOCK_EXPIRATION: u32 = 3; // in block number
-	const EXTERNAL_SERVER: &str = "http://localhost:9094";
 
-	pub type BoundedPeerString<T: Config> = BoundedVec<u8, <T as Config>::PeerStringLimit>;
+	pub type BoundedPeerString<T> = BoundedVec<u8, <T as Config>::PeerStringLimit>;
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> {
@@ -50,6 +46,10 @@ pub mod pallet {
 		type PeerStringLimit: Get<u32>;
 
 		type TrustedPeerLimit: Get<u32>;
+
+		type CandidatePeerLimit: Get<u32>;
+
+		type PeerLimit: Get<u32>;
 
 		/// The overarching dispatch call type.
 		type Call: From<Call<Self>>;
@@ -62,14 +62,28 @@ pub mod pallet {
 	pub struct Pallet<T>(_);
 
 	#[pallet::storage]
-	#[pallet::getter(fn peers)]
-	pub type Peers<T: Config> =
+	#[pallet::getter(fn peer_count)]
+	pub type PeerCount<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn peer_info)]
+	pub type PeerInfo<T: Config> =
 		StorageMap<_, Blake2_128Concat, BoundedPeerString<T>, OnChainPeerInfo<T>, OptionQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn provider_peer)]
 	pub type ProviderPeer<T: Config> =
 		StorageMap<_, Blake2_128Concat, T::AccountId, BoundedPeerString<T>, OptionQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn peers)]
+	pub type Peers<T: Config> =
+		StorageValue<_, BoundedVec<BoundedPeerString<T>, T::PeerLimit>, ValueQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn candidate_peers)]
+	pub type CandidatePeers<T: Config> =
+		StorageValue<_, BoundedVec<BoundedPeerString<T>, T::CandidatePeerLimit>, ValueQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn trusted_peers)]
@@ -90,6 +104,7 @@ pub mod pallet {
 	pub enum Event<T: Config> {
 		DataPeerRegistered(T::AccountId, BoundedPeerString<T>),
 		TrustedDataPeerRegistered(T::AccountId, BoundedPeerString<T>),
+		CandidateDataPeerRegistered(T::AccountId, BoundedPeerString<T>),
 		DataPeerUpdated(T::AccountId, BoundedPeerString<T>),
 		DataPeerRemoved(BoundedPeerString<T>),
 	}
@@ -107,6 +122,10 @@ pub mod pallet {
 		NoLocalAcctForSigning,
 		OffchainUnsignedTxError,
 		TrustedPeerLimited,
+		CandidatePeerLimited,
+		UpdateDataPeerInfoError,
+		AccountHasNoDataPeer,
+		PeerLimited,
 	}
 
 	#[pallet::hooks]
@@ -143,94 +162,17 @@ pub mod pallet {
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		#[pallet::weight(10_000)]
-		pub fn register_data_peer(
-			origin: OriginFor<T>,
-			params: PeerInfoParameters,
-		) -> DispatchResult {
-			let who = ensure_signed(origin)?;
-
-			let bounded_cluster_id: BoundedPeerString<T> =
-				params.cluster_id.clone().try_into().expect("cluster id is too long");
-			let mut bounded_cluster_public_address = None;
-			let mut bounded_ipfs_public_address = None;
-
-			if let Some(cluster_public_address) = params.cluster_public_address {
-				let bounded_cluster_public_address: BoundedPeerString<T> = cluster_public_address
-					.clone()
-					.try_into()
-					.expect("cluster public address is too long");
-			}
-			if let Some(ipfs_public_address) = params.ipfs_public_address {
-				let bounded_ipfs_public_address: BoundedPeerString<T> = ipfs_public_address
-					.clone()
-					.try_into()
-					.expect("ipfs public address is too long");
-			}
-
-			ensure!(!<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::AlreadyRegister);
-			ensure!(
-				!<Peers<T>>::contains_key(bounded_cluster_id.clone()),
-				<Error<T>>::AlreadyRegister
-			);
-
-			let current_block_number = <frame_system::Pallet<T>>::block_number();
-
-			let peer_info = OnChainPeerInfo {
-				cluster_id: bounded_cluster_id.clone(),
-				cluster_public_address: bounded_cluster_public_address.clone(),
-				ipfs_public_address: bounded_ipfs_public_address.clone(),
-				create_at: current_block_number,
-				provider: who.clone(),
-			};
-
-			<ProviderPeer<T>>::insert(who.clone(), bounded_cluster_id.clone());
-			<Peers<T>>::insert(bounded_cluster_id.clone(), peer_info.clone());
-
-			Self::deposit_event(<Event<T>>::DataPeerRegistered(who, bounded_cluster_id));
-
-			Ok(())
-		}
-
-		#[pallet::weight(10_000)]
 		pub fn register_trusted_data_peer(
 			origin: OriginFor<T>,
 			params: PeerInfoParameters,
 		) -> DispatchResult {
+			let _root = ensure_root(origin.clone());
+
 			let who = ensure_signed(origin)?;
 
-			let bounded_cluster_id: BoundedPeerString<T> =
-				params.cluster_id.clone().try_into().expect("cluster id is too long");
+			let bounded_cluster_id = Self::register_data_node(who.clone(), params)?;
 
-			
-			let mut bounded_cluster_public_address: Option<BoundedPeerString<T>> = None;
-			let mut bounded_ipfs_public_address: Option<BoundedPeerString<T>> = None;
-
-			if params.cluster_public_address.is_some() {
-				bounded_cluster_public_address = Some(params.cluster_public_address.clone().unwrap().try_into().expect("cluster public address is too long"));
-			}
-
-			if params.ipfs_public_address.is_some() {
-				bounded_ipfs_public_address = Some(params.ipfs_public_address.clone().unwrap().try_into().expect("ipfs public address is too long"));
-			}
-			
-			ensure!(!<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::AlreadyRegister);
-			ensure!(
-				!<Peers<T>>::contains_key(bounded_cluster_id.clone()),
-				<Error<T>>::AlreadyRegister
-			);
-
-			let current_block_number = <frame_system::Pallet<T>>::block_number();
-
-			let peer_info = OnChainPeerInfo {
-				cluster_id: bounded_cluster_id.clone(),
-				cluster_public_address: bounded_cluster_public_address.clone(),
-				ipfs_public_address: bounded_ipfs_public_address.clone(),
-				create_at: current_block_number,
-				provider: who.clone(),
-			};
-
-			<ProviderPeer<T>>::insert(who.clone(), bounded_cluster_id.clone());
-			<Peers<T>>::insert(bounded_cluster_id.clone(), peer_info.clone());
+			// storage to trusted peers
 			<TrustedPeers<T>>::try_mutate(|trusted_peers| {
 				trusted_peers.try_push(bounded_cluster_id.clone())
 			})
@@ -242,49 +184,81 @@ pub mod pallet {
 		}
 
 		#[pallet::weight(10_000)]
-		pub fn update_data_peer(origin: OriginFor<T>, peer_id: Vec<u8>) -> DispatchResult {
+		pub fn register_candidate_data_peer(
+			origin: OriginFor<T>,
+			params: PeerInfoParameters,
+		) -> DispatchResult {
+
 			let who = ensure_signed(origin)?;
 
-			// let bounded_peer_id: BoundedPeerString<T> =
-			// 	peer_id.clone().try_into().expect("peer id is too long");
+			let bounded_cluster_id = Self::register_data_node(who.clone(), params)?;
 
-			// ensure!(<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::NeedRegister);
-			// ensure!(
-			// 	<PeerAccount<T>>::contains_key(bounded_peer_id.clone()),
-			// 	<Error<T>>::NeedRegister
-			// );
+			// storage to candidate peers
+			<CandidatePeers<T>>::try_mutate(|candidate_peers| {
+				candidate_peers.try_push(bounded_cluster_id.clone())
+			})
+			.map_err(|_| <Error<T>>::CandidatePeerLimited)?;
 
-			// <ProviderPeer<T>>::mutate(&who, |value| {
-			// 	*value = Some(bounded_peer_id.clone());
-			// });
-
-			// <PeerAccount<T>>::mutate(&bounded_peer_id, |value| {
-			// 	*value = Some(who.clone());
-			// });
-
-			// Self::deposit_event(<Event<T>>::DataPeerUpdated(who, bounded_peer_id));
+			Self::deposit_event(<Event<T>>::CandidateDataPeerRegistered(who, bounded_cluster_id));
 
 			Ok(())
 		}
 
+		#[pallet::weight(10_000)]
+		pub fn update_data_peer_info(
+			origin: OriginFor<T>,
+			params: UpdatablePeerInfoParameters,
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+
+			let (bounded_cluster_public_address, bounded_ipfs_public_address) =
+				Self::get_peer_info_value_from_updatable_param(params)?;
+
+			let peer_id = Self::provider_peer(&who);
+
+			ensure!(peer_id.is_some(), <Error<T>>::AccountHasNoDataPeer);
+
+			<PeerInfo<T>>::try_mutate(&peer_id.clone().unwrap(), |peer_option| {
+				if let Some(peer) = peer_option {
+					peer.cluster_public_address = bounded_cluster_public_address.clone();
+					peer.ipfs_public_address = bounded_ipfs_public_address.clone();
+					Ok(())
+				} else {
+					Err(())
+				}
+			})
+			.map_err(|_| <Error<T>>::UpdateDataPeerInfoError)?;
+
+			Self::deposit_event(<Event<T>>::DataPeerUpdated(who, peer_id.clone().unwrap()));
+
+			Ok(())
+		}
+
+		#[pallet::weight(10_000)]
+		pub fn remove_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
+			let _root = ensure_root(origin.clone())?;
+
+			let who = ensure_signed(origin)?;
+
+			Ok(())
+		}
+
+		// for off-chain worker
+
 		#[pallet::weight(0)]
-		pub fn remove_data_peer(origin: OriginFor<T>, peers_id: Vec<Vec<u8>>) -> DispatchResult {
-			let _ = ensure_signed(origin)?;
+		pub fn register_data_peer(
+			origin: OriginFor<T>,
+			params: PeerInfoParameters,
+		) -> DispatchResult {
+			let _ = ensure_none(origin)?;
 
-			// for peer_id in peers_id {
-			// 	let bounded_peer_id: BoundedPeerString<T> =
-			// 		peer_id.clone().try_into().expect("peer id is too long");
-			// 	// if let Some(bounded_peer_id) = bounded_peer_id_wrap {
-			// 	if <PeerAccount<T>>::contains_key(bounded_peer_id.clone()) {
-			// 		if let Some(account_id) = Self::peer_account(&bounded_peer_id) {
-			// 			<ProviderPeer<T>>::remove(account_id);
-			// 		}
+			// let next_peer_count =
+			// Self::peer_count().checked_add(1_u32.into()).ok_or(<Error<T>>::PeerLimited)?;
+			// // increase peer count
+			// <PeerCount<T>>::put(next_peer_count);
 
-			// 		<PeerAccount<T>>::remove(bounded_peer_id.clone());
-			// 		Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_peer_id));
-			// 	}
-			// }
-
+			// let bounded_cluster_id = Self::register_data_node(who.clone(), params)?;
+			// Self::deposit_event(<Event<T>>::DataPeerRegistered(who, bounded_cluster_id));
 			Ok(())
 		}
 
@@ -295,12 +269,11 @@ pub mod pallet {
 			peers_id: Vec<Vec<u8>>,
 		) -> DispatchResult {
 			let _ = ensure_none(origin)?;
-
-			log::info!("Remove unsiged data");
-
 			// for peer_id in peers_id {
+
 			// 	let bounded_peer_id: BoundedPeerString<T> =
 			// 		peer_id.clone().try_into().expect("peer id is too long");
+
 			// 	if <PeerAccount<T>>::contains_key(bounded_peer_id.clone()) {
 			// 		if let Some(account_id) = Self::peer_account(&bounded_peer_id) {
 			// 			<ProviderPeer<T>>::remove(account_id);
@@ -316,38 +289,144 @@ pub mod pallet {
 	}
 
 	impl<T: Config> Pallet<T> {
+		fn get_peer_info_value_from_updatable_param(
+			params: UpdatablePeerInfoParameters,
+		) -> Result<(Option<BoundedPeerString<T>>, Option<BoundedPeerString<T>>), Error<T>> {
+			let mut bounded_cluster_public_address: Option<BoundedPeerString<T>> = None;
+			let mut bounded_ipfs_public_address: Option<BoundedPeerString<T>> = None;
+
+			if params.cluster_public_address.is_some() {
+				bounded_cluster_public_address = Some(
+					params
+						.cluster_public_address
+						.clone()
+						.unwrap()
+						.try_into()
+						.expect("cluster public address is too long"),
+				);
+			}
+
+			if params.ipfs_public_address.is_some() {
+				bounded_ipfs_public_address = Some(
+					params
+						.ipfs_public_address
+						.clone()
+						.unwrap()
+						.try_into()
+						.expect("ipfs public address is too long"),
+				);
+			}
+
+			Ok((bounded_cluster_public_address, bounded_ipfs_public_address))
+		}
+
+		fn get_peer_info_value_from_param(
+			params: PeerInfoParameters,
+		) -> Result<
+			(BoundedPeerString<T>, Option<BoundedPeerString<T>>, Option<BoundedPeerString<T>>),
+			Error<T>,
+		> {
+			let bounded_cluster_id: BoundedPeerString<T> =
+				params.cluster_id.clone().try_into().expect("cluster id is too long");
+				let mut bounded_cluster_public_address: Option<BoundedPeerString<T>> = None;
+				let mut bounded_ipfs_public_address: Option<BoundedPeerString<T>> = None;
+				if params.cluster_public_address.is_some() {
+					bounded_cluster_public_address = Some(
+						params
+							.cluster_public_address
+							.clone()
+							.unwrap()
+							.try_into()
+							.expect("cluster public address is too long"),
+					);
+				}
+	
+				if params.ipfs_public_address.is_some() {
+					bounded_ipfs_public_address = Some(
+						params
+							.ipfs_public_address
+							.clone()
+							.unwrap()
+							.try_into()
+							.expect("ipfs public address is too long"),
+					);
+				}
+			Ok((bounded_cluster_id, bounded_cluster_public_address, bounded_ipfs_public_address))
+		}
+
+		fn prepare_peer_to_persist(
+			who: T::AccountId,
+			params: PeerInfoParameters,
+		) -> Result<OnChainPeerInfo<T>, Error<T>> {
+			let (bounded_cluster_id, bounded_cluster_public_address, bounded_ipfs_public_address) =
+				Self::get_peer_info_value_from_param(params)?;
+
+			ensure!(!<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::AlreadyRegister);
+
+			ensure!(
+				!<PeerInfo<T>>::contains_key(bounded_cluster_id.clone()),
+				<Error<T>>::AlreadyRegister
+			);
+
+			let current_block_number = <frame_system::Pallet<T>>::block_number();
+
+			let peer_info = OnChainPeerInfo {
+				cluster_id: bounded_cluster_id.clone(),
+				cluster_public_address: bounded_cluster_public_address.clone(),
+				ipfs_public_address: bounded_ipfs_public_address.clone(),
+				create_at: current_block_number,
+				provider: who.clone(),
+			};
+
+			Ok(peer_info)
+		}
+
+		fn register_data_node(
+			who: T::AccountId,
+			params: PeerInfoParameters,
+		) -> Result<BoundedPeerString<T>, Error<T>> {
+			let peer_info = Self::prepare_peer_to_persist(who.clone(), params.clone())?;
+
+			let peer_id = peer_info.clone().cluster_id;
+
+			<ProviderPeer<T>>::insert(who.clone(), peer_id.clone());
+			<PeerInfo<T>>::insert(peer_id.clone(), peer_info.clone());
+
+			Ok(peer_id.clone())
+		}
+
 		fn offchain_signed_tx() -> Result<(), Error<T>> {
 			let peers_id = Self::fetch_peers_n_remove();
 
-			if peers_id.len() <= 0 {
-				return Ok(());
-			}
+			// if peers_id.len() <= 0 {
+			// 	return Ok(());
+			// }
 
-			// We retrieve a signer and check if it is valid.
-			//   Since this pallet only has one key in the keystore. We use `any_account()1 to
-			//   retrieve it. If there are multiple keys and we want to pinpoint it, `with_filter()` can be chained,
-			let signer = Signer::<T, T::AuthorityId>::any_account();
+			// // We retrieve a signer and check if it is valid.
+			// //   Since this pallet only has one key in the keystore. We use `any_account()1 to
+			// //   retrieve it. If there are multiple keys and we want to pinpoint it, `with_filter()` can be chained,
+			// let signer = Signer::<T, T::AuthorityId>::any_account();
 
-			// Translating the current block number to number and submit it on-chain
-			// let number: u64 = block_number.try_into().unwrap_or(0);
+			// // Translating the current block number to number and submit it on-chain
+			// // let number: u64 = block_number.try_into().unwrap_or(0);
 
-			// `result` is in the type of `Option<(Account<T>, Result<(), ()>)>`. It is:
-			//   - `None`: no account is available for sending transaction
-			//   - `Some((account, Ok(())))`: transaction is successfully sent
-			//   - `Some((account, Err(())))`: error occured when sending the transaction
-			let result = signer.send_signed_transaction(|_acct|
-				// This is the on-chain function
-				Call::remove_data_peer { peers_id: peers_id.clone(), });
+			// // `result` is in the type of `Option<(Account<T>, Result<(), ()>)>`. It is:
+			// //   - `None`: no account is available for sending transaction
+			// //   - `Some((account, Ok(())))`: transaction is successfully sent
+			// //   - `Some((account, Err(())))`: error occured when sending the transaction
+			// let result = signer.send_signed_transaction(|_acct|
+			// 	// This is the on-chain function
+			// 	Call::remove_data_peer { peers_id: peers_id.clone(), });
 
-			// Display error if the signed tx fails.
-			if let Some((acc, res)) = result {
-				if res.is_err() {
-					log::error!("failure: offchain_signed_tx: tx sent: {:?}", acc.id);
-					return Err(<Error<T>>::OffchainSignedTxError);
-				}
-				// Transaction is sent successfully
-				return Ok(());
-			}
+			// // Display error if the signed tx fails.
+			// if let Some((acc, res)) = result {
+			// 	if res.is_err() {
+			// 		log::error!("failure: offchain_signed_tx: tx sent: {:?}", acc.id);
+			// 		return Err(<Error<T>>::OffchainSignedTxError);
+			// 	}
+			// 	// Transaction is sent successfully
+			// 	return Ok(());
+			// }
 
 			// The case of `None`: no account is available for sending
 			log::error!("No local account available");
