@@ -1,6 +1,26 @@
-use codec::{Decode, Encode};
+use codec::{Decode, Encode, MaxEncodedLen};
 use frame_support::inherent::Vec;
+use scale_info::TypeInfo;
 use serde::{Deserialize, Deserializer};
+
+use crate::*;
+
+#[derive(Encode, Decode, Debug, TypeInfo, MaxEncodedLen)]
+pub struct OnChainPeerInfo<T: Config> {
+	pub cluster_id: BoundedPeerString<T>,
+	// pub ipfs_id: BoundedPeerString<T>,
+	pub cluster_public_address: Option<BoundedPeerString<T>>,
+	pub ipfs_public_address: Option<BoundedPeerString<T>>,
+	pub create_at: T::BlockNumber,
+	pub provider: T::AccountId,
+}
+
+#[derive(Encode, Decode, Deserialize)]
+pub struct PeerInfoParameters {
+	pub cluster_id: Vec<u8>,
+	pub cluster_public_address: Option<Vec<u8>>,
+	pub ipfs_public_address: Option<Vec<u8>>,
+}
 
 #[derive(Encode, Decode, Debug, Deserialize)]
 pub struct Peer {

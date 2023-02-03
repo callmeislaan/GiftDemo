@@ -11,14 +11,16 @@ pub mod pallet {
 	pub use crate::types::*;
 
 	use frame_support::inherent::Vec;
-	use frame_support::pallet_prelude::{OptionQuery, *};
+	use frame_support::pallet_prelude::*;
 	use frame_support::unsigned::TransactionValidity;
 	use frame_support::{ensure, Blake2_128Concat, BoundedVec};
+	use frame_support::{BoundedVec, StorageMap, StorageValue};
 	use frame_system as system;
 	use frame_system::offchain::{
 		AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer, SubmitTransaction,
 	};
 	use frame_system::pallet_prelude::*;
+	use frame_system::Config;
 	use serde_json::Deserializer;
 	use sp_core::crypto::KeyTypeId;
 	use sp_runtime::offchain::{http, Duration};
@@ -41,13 +43,15 @@ pub mod pallet {
 	const LOCK_BLOCK_EXPIRATION: u32 = 3; // in block number
 	const EXTERNAL_SERVER: &str = "http://localhost:9094";
 
-	pub type DataPeer<T: Config> = BoundedVec<u8, T::PeerIdLimit>;
+	pub type BoundedPeerString<T: Config> = BoundedVec<u8, T::PeerStringLimit>;
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> {
 		type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
 
-		type PeerIdLimit: Get<u32>;
+		type PeerStringLimit: Get<u32>;
+
+		type TrustedPeerLimit: Get<u32>;
 
 		/// The overarching dispatch call type.
 		type Call: From<Call<Self>>;
@@ -60,14 +64,19 @@ pub mod pallet {
 	pub struct Pallet<T>(_);
 
 	#[pallet::storage]
-	#[pallet::getter(fn account_peer)]
-	pub type AccountPeer<T: Config> =
-		StorageMap<_, Blake2_128Concat, T::AccountId, DataPeer<T>, OptionQuery>;
+	#[pallet::getter(fn peers)]
+	pub type Peers<T: Config> =
+		StorageMap<_, Blake2_128Concat, BoundedPeerString<T>, OnChainPeerInfo<T>, OptionQuery>;
 
 	#[pallet::storage]
-	#[pallet::getter(fn peer_account)]
-	pub type PeerAccount<T: Config> =
-		StorageMap<_, Blake2_128Concat, DataPeer<T>, T::AccountId, OptionQuery>;
+	#[pallet::getter(fn provider_peer)]
+	pub type ProviderPeer<T: Config> =
+		StorageMap<_, Blake2_128Concat, T::AccountId, BoundedPeerString<T>, OptionQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn trusted_peers)]
+	pub type TruestedPeers<T: Config> =
+		StorageValue<_, BoundedVec<BoundedPeerString<T>, T::TrustedPeerLimit>, ValueQuery>;
 
 	/// Defines the block when next unsigned transaction will be accepted.
 	///
@@ -81,9 +90,10 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		DataPeerRegistered(T::AccountId, DataPeer<T>),
-		DataPeerUpdated(T::AccountId, DataPeer<T>),
-		DataPeerRemoved(DataPeer<T>),
+		DataPeerRegistered(T::AccountId, BoundedPeerString<T>),
+		TrustedDataPeerRegistered(T::AccountId, BoundedPeerString<T>),
+		DataPeerUpdated(T::AccountId, BoundedPeerString<T>),
+		DataPeerRemoved(BoundedPeerString<T>),
 	}
 
 	#[pallet::error]
@@ -98,6 +108,7 @@ pub mod pallet {
 		OffchainSignedTxError,
 		NoLocalAcctForSigning,
 		OffchainUnsignedTxError,
+		TrustedPeerLimited,
 	}
 
 	#[pallet::hooks]
@@ -121,9 +132,7 @@ pub mod pallet {
 			// ensure transaction come from local
 
 			log::info!("Data source: {:?}", source);
-			ensure!(source != TransactionSource::External, {
-				InvalidTransaction::Custom(3)
-			});
+			ensure!(source != TransactionSource::External, { InvalidTransaction::Custom(3) });
 
 			if let Call::remove_data_peer_unsigned { block_number, peers_id } = call {
 				Self::validate_transaction_parameters(block_number, peers_id)
@@ -136,22 +145,110 @@ pub mod pallet {
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
 		#[pallet::weight(10_000)]
-		pub fn register_data_peer(origin: OriginFor<T>, peer_id: Vec<u8>) -> DispatchResult {
+		pub fn register_data_peer(
+			origin: OriginFor<T>,
+			params: PeerInfoParameters,
+		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 
-			let bounded_peer_id: DataPeer<T> =
-				peer_id.clone().try_into().expect("peer id is too long");
+			let bounded_cluster_id: BoundedPeerString<T> =
+				params.cluster_id.clone().try_into().expect("cluster id is too long");
+			let mut bounded_cluster_public_address = None;
+			let mut bounded_ipfs_public_address = None;
 
-			ensure!(!<AccountPeer<T>>::contains_key(who.clone()), <Error<T>>::AlreadyRegister);
+			if let Some(cluster_public_address) = params.cluster_public_address {
+				let bounded_cluster_public_address: BoundedPeerString<T> = cluster_public_address
+					.clone()
+					.try_into()
+					.expect("cluster public address is too long");
+			}
+			if let Some(ipfs_public_address) = params.ipfs_public_address {
+				let bounded_ipfs_public_address: BoundedPeerString<T> = ipfs_public_address
+					.clone()
+					.try_into()
+					.expect("ipfs public address is too long");
+			}
+
+			ensure!(!<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::AlreadyRegister);
 			ensure!(
 				!<PeerAccount<T>>::contains_key(bounded_peer_id.clone()),
 				<Error<T>>::AlreadyRegister
 			);
 
-			<AccountPeer<T>>::insert(who.clone(), bounded_peer_id.clone());
-			<PeerAccount<T>>::insert(bounded_peer_id.clone(), who.clone());
+			let current_block_number = <frame_system::Pallet<T>>::block_number();
 
-			Self::deposit_event(<Event<T>>::DataPeerRegistered(who, bounded_peer_id));
+			let peer_info = OnChainPeerInfo {
+				cluster_id: bounded_cluster_id,
+				cluster_public_address: bounded_cluster_public_address,
+				ipfs_public_address: bounded_ipfs_public_address,
+				create_at: current_block_number,
+				provider: who.clone(),
+			};
+
+			<ProviderPeer<T>>::insert(who.clone(), bounded_cluster_id.clone());
+			<Peers<T>>::insert(bounded_cluster_id.clone(), peer_info.clone());
+
+			Self::deposit_event(<Event<T>>::DataPeerRegistered(who, bounded_cluster_id));
+
+			Ok(())
+		}
+	}
+
+	#[pallet::call]
+	impl<T: Config> Pallet<T> {
+		#[pallet::weight(10_000)]
+		pub fn register_trusted_data_peer(
+			origin: OriginFor<T>,
+			params: PeerInfoParameters,
+		) -> DispatchResult {
+			let who = ensure_root(origin)?;
+
+			let bounded_cluster_id: BoundedPeerString<T> =
+				params.cluster_id.clone().try_into().expect("cluster id is too long");
+			let mut bounded_cluster_public_address = None;
+			let mut bounded_ipfs_public_address = None;
+
+			if let Some(cluster_public_address) = params.cluster_public_address {
+				let bounded_cluster_public_address: BoundedPeerString<T> = cluster_public_address
+					.clone()
+					.try_into()
+					.expect("cluster public address is too long");
+			}
+			if let Some(ipfs_public_address) = params.ipfs_public_address {
+				let bounded_ipfs_public_address: BoundedPeerString<T> = ipfs_public_address
+					.clone()
+					.try_into()
+					.expect("ipfs public address is too long");
+			}
+
+			ensure!(!<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::AlreadyRegister);
+			ensure!(
+				!<PeerAccount<T>>::contains_key(bounded_cluster_id.clone()),
+				<Error<T>>::AlreadyRegister
+			);
+			ensure!(
+				!<TruestedPeers<T>>::contains(bounded_cluster_id.clone()),
+				<Error<T>>::AlreadyRegister
+			);
+
+			let current_block_number = <frame_system::Pallet<T>>::block_number();
+
+			let peer_info = OnChainPeerInfo {
+				cluster_id: bounded_cluster_id,
+				cluster_public_address: bounded_cluster_public_address,
+				ipfs_public_address: bounded_ipfs_public_address,
+				create_at: current_block_number,
+				provider: who.clone(),
+			};
+
+			<ProviderPeer<T>>::insert(who.clone(), bounded_cluster_id.clone());
+			<Peers<T>>::insert(bounded_cluster_id.clone(), peer_info.clone());
+			<TrustedPeers<T>>::try_mutate(|trusted_peers| {
+				trusted_peers.try_push(bounded_cluster_id.clone())
+			})
+			.map_err(|_| <Error<T>>::TrustedPeerLimited)?;
+
+			Self::deposit_event(<Event<T>>::TrustedDataPeerRegistered(who, bounded_cluster_id));
 
 			Ok(())
 		}
@@ -160,24 +257,24 @@ pub mod pallet {
 		pub fn update_data_peer(origin: OriginFor<T>, peer_id: Vec<u8>) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 
-			let bounded_peer_id: DataPeer<T> =
-				peer_id.clone().try_into().expect("peer id is too long");
+			// let bounded_peer_id: BoundedPeerString<T> =
+			// 	peer_id.clone().try_into().expect("peer id is too long");
 
-			ensure!(<AccountPeer<T>>::contains_key(who.clone()), <Error<T>>::NeedRegister);
-			ensure!(
-				<PeerAccount<T>>::contains_key(bounded_peer_id.clone()),
-				<Error<T>>::NeedRegister
-			);
+			// ensure!(<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::NeedRegister);
+			// ensure!(
+			// 	<PeerAccount<T>>::contains_key(bounded_peer_id.clone()),
+			// 	<Error<T>>::NeedRegister
+			// );
 
-			<AccountPeer<T>>::mutate(&who, |value| {
-				*value = Some(bounded_peer_id.clone());
-			});
+			// <ProviderPeer<T>>::mutate(&who, |value| {
+			// 	*value = Some(bounded_peer_id.clone());
+			// });
 
-			<PeerAccount<T>>::mutate(&bounded_peer_id, |value| {
-				*value = Some(who.clone());
-			});
+			// <PeerAccount<T>>::mutate(&bounded_peer_id, |value| {
+			// 	*value = Some(who.clone());
+			// });
 
-			Self::deposit_event(<Event<T>>::DataPeerUpdated(who, bounded_peer_id));
+			// Self::deposit_event(<Event<T>>::DataPeerUpdated(who, bounded_peer_id));
 
 			Ok(())
 		}
@@ -186,20 +283,19 @@ pub mod pallet {
 		pub fn remove_data_peer(origin: OriginFor<T>, peers_id: Vec<Vec<u8>>) -> DispatchResult {
 			let _ = ensure_signed(origin)?;
 
-			for peer_id in peers_id {
-				let bounded_peer_id: DataPeer<T> =
-					peer_id.clone().try_into().expect("peer id is too long");
-				// if let Some(bounded_peer_id) = bounded_peer_id_wrap {
-				if <PeerAccount<T>>::contains_key(bounded_peer_id.clone()) {
-					if let Some(account_id) = Self::peer_account(&bounded_peer_id) {
-						<AccountPeer<T>>::remove(account_id);
-					}
+			// for peer_id in peers_id {
+			// 	let bounded_peer_id: BoundedPeerString<T> =
+			// 		peer_id.clone().try_into().expect("peer id is too long");
+			// 	// if let Some(bounded_peer_id) = bounded_peer_id_wrap {
+			// 	if <PeerAccount<T>>::contains_key(bounded_peer_id.clone()) {
+			// 		if let Some(account_id) = Self::peer_account(&bounded_peer_id) {
+			// 			<ProviderPeer<T>>::remove(account_id);
+			// 		}
 
-					<PeerAccount<T>>::remove(bounded_peer_id.clone());
-					Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_peer_id));
-				}
-				// }
-			}
+			// 		<PeerAccount<T>>::remove(bounded_peer_id.clone());
+			// 		Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_peer_id));
+			// 	}
+			// }
 
 			Ok(())
 		}
@@ -214,20 +310,18 @@ pub mod pallet {
 
 			log::info!("Remove unsiged data");
 
-			for peer_id in peers_id {
-				let bounded_peer_id: DataPeer<T> =
-					peer_id.clone().try_into().expect("peer id is too long");
-				// if let Some(bounded_peer_id) = bounded_peer_id_wrap {
-				if <PeerAccount<T>>::contains_key(bounded_peer_id.clone()) {
-					if let Some(account_id) = Self::peer_account(&bounded_peer_id) {
-						<AccountPeer<T>>::remove(account_id);
-					}
+			// for peer_id in peers_id {
+			// 	let bounded_peer_id: BoundedPeerString<T> =
+			// 		peer_id.clone().try_into().expect("peer id is too long");
+			// 	if <PeerAccount<T>>::contains_key(bounded_peer_id.clone()) {
+			// 		if let Some(account_id) = Self::peer_account(&bounded_peer_id) {
+			// 			<ProviderPeer<T>>::remove(account_id);
+			// 		}
 
-					<PeerAccount<T>>::remove(bounded_peer_id.clone());
-					Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_peer_id));
-				}
-				// }
-			}
+			// 		<PeerAccount<T>>::remove(bounded_peer_id.clone());
+			// 		Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_peer_id));
+			// 	}
+			// }
 
 			Ok(())
 		}
@@ -345,7 +439,6 @@ pub mod pallet {
 			block_number: &T::BlockNumber,
 			peers_id: &Vec<Vec<u8>>,
 		) -> TransactionValidity {
-
 			log::info!("Validate transaction parameters");
 
 			// Now let's check if the transaction has any chance to succeed.

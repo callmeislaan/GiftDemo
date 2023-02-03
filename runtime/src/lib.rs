@@ -292,9 +292,10 @@ impl pallet_customers::Config for Runtime {
 
 impl pallet_data::Config for Runtime {
 	type Event = Event;
-	type PeerIdLimit = ConstU32<{ u32::MAX }>;
+	type PeerStringLimit = ConstU32<{ u32::MAX }>;
 	type AuthorityId = pallet_data::crypto::DataNodeManagementAuthId;
 	type Call = Call;
+	type TrustedPeerLimit = ConstU32<3_u32>;
 }
 
 impl<LocalCall> frame_system::offchain::CreateSignedTransaction<LocalCall> for Runtime
