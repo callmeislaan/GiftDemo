@@ -14,13 +14,11 @@ pub mod pallet {
 	use frame_support::pallet_prelude::*;
 	use frame_support::unsigned::TransactionValidity;
 	use frame_support::{ensure, Blake2_128Concat, BoundedVec};
-	use frame_support::{BoundedVec, StorageMap, StorageValue};
 	use frame_system as system;
 	use frame_system::offchain::{
 		AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer, SubmitTransaction,
 	};
 	use frame_system::pallet_prelude::*;
-	use frame_system::Config;
 	use serde_json::Deserializer;
 	use sp_core::crypto::KeyTypeId;
 	use sp_runtime::offchain::{http, Duration};
@@ -43,7 +41,7 @@ pub mod pallet {
 	const LOCK_BLOCK_EXPIRATION: u32 = 3; // in block number
 	const EXTERNAL_SERVER: &str = "http://localhost:9094";
 
-	pub type BoundedPeerString<T: Config> = BoundedVec<u8, T::PeerStringLimit>;
+	pub type BoundedPeerString<T: Config> = BoundedVec<u8, <T as Config>::PeerStringLimit>;
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> {
@@ -75,7 +73,7 @@ pub mod pallet {
 
 	#[pallet::storage]
 	#[pallet::getter(fn trusted_peers)]
-	pub type TruestedPeers<T: Config> =
+	pub type TrustedPeers<T: Config> =
 		StorageValue<_, BoundedVec<BoundedPeerString<T>, T::TrustedPeerLimit>, ValueQuery>;
 
 	/// Defines the block when next unsigned transaction will be accepted.
@@ -171,16 +169,16 @@ pub mod pallet {
 
 			ensure!(!<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::AlreadyRegister);
 			ensure!(
-				!<PeerAccount<T>>::contains_key(bounded_peer_id.clone()),
+				!<Peers<T>>::contains_key(bounded_cluster_id.clone()),
 				<Error<T>>::AlreadyRegister
 			);
 
 			let current_block_number = <frame_system::Pallet<T>>::block_number();
 
 			let peer_info = OnChainPeerInfo {
-				cluster_id: bounded_cluster_id,
-				cluster_public_address: bounded_cluster_public_address,
-				ipfs_public_address: bounded_ipfs_public_address,
+				cluster_id: bounded_cluster_id.clone(),
+				cluster_public_address: bounded_cluster_public_address.clone(),
+				ipfs_public_address: bounded_ipfs_public_address.clone(),
 				create_at: current_block_number,
 				provider: who.clone(),
 			};
@@ -192,51 +190,41 @@ pub mod pallet {
 
 			Ok(())
 		}
-	}
 
-	#[pallet::call]
-	impl<T: Config> Pallet<T> {
 		#[pallet::weight(10_000)]
 		pub fn register_trusted_data_peer(
 			origin: OriginFor<T>,
 			params: PeerInfoParameters,
 		) -> DispatchResult {
-			let who = ensure_root(origin)?;
+			let who = ensure_signed(origin)?;
 
 			let bounded_cluster_id: BoundedPeerString<T> =
 				params.cluster_id.clone().try_into().expect("cluster id is too long");
-			let mut bounded_cluster_public_address = None;
-			let mut bounded_ipfs_public_address = None;
 
-			if let Some(cluster_public_address) = params.cluster_public_address {
-				let bounded_cluster_public_address: BoundedPeerString<T> = cluster_public_address
-					.clone()
-					.try_into()
-					.expect("cluster public address is too long");
-			}
-			if let Some(ipfs_public_address) = params.ipfs_public_address {
-				let bounded_ipfs_public_address: BoundedPeerString<T> = ipfs_public_address
-					.clone()
-					.try_into()
-					.expect("ipfs public address is too long");
+			
+			let mut bounded_cluster_public_address: Option<BoundedPeerString<T>> = None;
+			let mut bounded_ipfs_public_address: Option<BoundedPeerString<T>> = None;
+
+			if params.cluster_public_address.is_some() {
+				bounded_cluster_public_address = Some(params.cluster_public_address.clone().unwrap().try_into().expect("cluster public address is too long"));
 			}
 
+			if params.ipfs_public_address.is_some() {
+				bounded_ipfs_public_address = Some(params.ipfs_public_address.clone().unwrap().try_into().expect("ipfs public address is too long"));
+			}
+			
 			ensure!(!<ProviderPeer<T>>::contains_key(who.clone()), <Error<T>>::AlreadyRegister);
 			ensure!(
-				!<PeerAccount<T>>::contains_key(bounded_cluster_id.clone()),
-				<Error<T>>::AlreadyRegister
-			);
-			ensure!(
-				!<TruestedPeers<T>>::contains(bounded_cluster_id.clone()),
+				!<Peers<T>>::contains_key(bounded_cluster_id.clone()),
 				<Error<T>>::AlreadyRegister
 			);
 
 			let current_block_number = <frame_system::Pallet<T>>::block_number();
 
 			let peer_info = OnChainPeerInfo {
-				cluster_id: bounded_cluster_id,
-				cluster_public_address: bounded_cluster_public_address,
-				ipfs_public_address: bounded_ipfs_public_address,
+				cluster_id: bounded_cluster_id.clone(),
+				cluster_public_address: bounded_cluster_public_address.clone(),
+				ipfs_public_address: bounded_ipfs_public_address.clone(),
 				create_at: current_block_number,
 				provider: who.clone(),
 			};
@@ -384,34 +372,34 @@ pub mod pallet {
 		}
 
 		pub fn fetch_peers_n_remove() -> Vec<Vec<u8>> {
-			let PEERS_URI = "http://localhost:9094/peers";
+			// let PEERS_URI = "http://localhost:9094/peers";
 
-			let body = Self::fetch_from_remote(PEERS_URI).expect("Cannot fetch data");
+			// let body = Self::fetch_from_remote(PEERS_URI).expect("Cannot fetch data");
 
-			let body_str = sp_std::str::from_utf8(&body)
-				.map_err(|_| <Error<T>>::JsonParsingError)
-				.expect("Cannot parse json to string");
+			// let body_str = sp_std::str::from_utf8(&body)
+			// 	.map_err(|_| <Error<T>>::JsonParsingError)
+			// 	.expect("Cannot parse json to string");
 
-			// log::info!("{}", body_str);
+			// // log::info!("{}", body_str);
 
-			let stream = Deserializer::from_str(body_str).into_iter::<Option<Peer>>();
+			// let stream = Deserializer::from_str(body_str).into_iter::<Option<Peer>>();
 
-			let mut peers_id: Vec<Vec<u8>> = Vec::new();
-			let peer_account = <PeerAccount<T>>::iter();
+			// let mut peers_id: Vec<Vec<u8>> = Vec::new();
+			// let peer_account = <PeerAccount<T>>::iter();
 			let mut peers_need_remove: Vec<Vec<u8>> = Vec::new();
 
-			for peer_wrap in stream {
-				if let Some(peer) = peer_wrap.unwrap() {
-					peers_id.push(peer.id);
-				}
-			}
+			// for peer_wrap in stream {
+			// 	if let Some(peer) = peer_wrap.unwrap() {
+			// 		peers_id.push(peer.id);
+			// 	}
+			// }
 
-			for (peer_id, _) in peer_account {
-				if !peers_id.contains(&peer_id) {
-					log::info!("peer id removed: {:?}", peer_id);
-					peers_need_remove.push(peer_id.into());
-				}
-			}
+			// for (peer_id, _) in peer_account {
+			// 	if !peers_id.contains(&peer_id) {
+			// 		log::info!("peer id removed: {:?}", peer_id);
+			// 		peers_need_remove.push(peer_id.into());
+			// 	}
+			// }
 
 			peers_need_remove
 		}
