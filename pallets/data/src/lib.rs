@@ -62,10 +62,6 @@ pub mod pallet {
 	pub struct Pallet<T>(_);
 
 	#[pallet::storage]
-	#[pallet::getter(fn peer_count)]
-	pub type PeerCount<T: Config> = StorageValue<_, u32, ValueQuery>;
-
-	#[pallet::storage]
 	#[pallet::getter(fn peer_info)]
 	pub type PeerInfo<T: Config> =
 		StorageMap<_, Blake2_128Concat, BoundedPeerString<T>, OnChainPeerInfo<T>, OptionQuery>;
@@ -126,6 +122,8 @@ pub mod pallet {
 		UpdateDataPeerInfoError,
 		AccountHasNoDataPeer,
 		PeerLimited,
+		DataPeerNotExists,
+		ProviderPeerNotExists,
 	}
 
 	#[pallet::hooks]
@@ -165,12 +163,11 @@ pub mod pallet {
 		pub fn register_trusted_data_peer(
 			origin: OriginFor<T>,
 			params: PeerInfoParameters,
+			provider: T::AccountId,
 		) -> DispatchResult {
 			let _root = ensure_root(origin.clone());
 
-			let who = ensure_signed(origin)?;
-
-			let bounded_cluster_id = Self::register_data_node(who.clone(), params)?;
+			let bounded_cluster_id = Self::register_data_node(provider.clone(), params)?;
 
 			// storage to trusted peers
 			<TrustedPeers<T>>::try_mutate(|trusted_peers| {
@@ -178,7 +175,7 @@ pub mod pallet {
 			})
 			.map_err(|_| <Error<T>>::TrustedPeerLimited)?;
 
-			Self::deposit_event(<Event<T>>::TrustedDataPeerRegistered(who, bounded_cluster_id));
+			Self::deposit_event(<Event<T>>::TrustedDataPeerRegistered(provider, bounded_cluster_id));
 
 			Ok(())
 		}
@@ -235,13 +232,121 @@ pub mod pallet {
 		}
 
 		#[pallet::weight(10_000)]
+		pub fn remove_provider_data_peer(origin: OriginFor<T>, provider: T::AccountId) -> DispatchResult {
+			let _root = ensure_root(origin.clone())?;
+
+			let cluster_id = Self::provider_peer(&provider).ok_or(<Error<T>>::ProviderPeerNotExists)?;
+
+			<CandidatePeers<T>>::try_mutate(|peers| {
+				let index_option = peers.iter().position(|x| *x == cluster_id.clone());
+				if let Some(index) = index_option {
+					peers.remove(index);
+					return Ok(());
+				}
+				Err(())
+			});
+
+			<Peers<T>>::try_mutate(|peers| {
+				let index_option = peers.iter().position(|x| *x == cluster_id.clone());
+				if let Some(index) = index_option {
+					peers.remove(index);
+					return Ok(());
+				}
+				Err(())
+			});
+
+			<TrustedPeers<T>>::try_mutate(|peers| {
+				let index_option = peers.iter().position(|x| *x == cluster_id.clone());
+				if let Some(index) = index_option {
+					peers.remove(index);
+					return Ok(());
+				}
+				Err(())
+			});
+
+			<ProviderPeer<T>>::remove(provider);
+
+			<PeerInfo<T>>::remove(cluster_id.clone());
+
+			Self::deposit_event(<Event<T>>::DataPeerRemoved(cluster_id));
+
+			Ok(())
+		}
+
+		#[pallet::weight(10_000)]
 		pub fn remove_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
 			let _root = ensure_root(origin.clone())?;
 
 			let who = ensure_signed(origin)?;
 
+			let bounded_cluster_id: BoundedPeerString<T> = cluster_id.try_into().expect("cluster id is too long");
+
+			// delete peers if exists
+			<Peers<T>>::try_mutate(|peers| {
+				let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+				if let Some(index) = index_option {
+					peers.remove(index);
+					return Ok(());
+				}
+				Err(())
+			}).map_err(|_| <Error<T>>::DataPeerNotExists)?;
+
+			Self::remove_data_node(bounded_cluster_id.clone());
+
+			Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_cluster_id));
+
 			Ok(())
 		}
+
+		#[pallet::weight(10_000)]
+		pub fn remove_candidate_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+
+			let bounded_cluster_id: BoundedPeerString<T> = cluster_id.try_into().expect("cluster id is too long");
+
+			// delete peers if exists
+			<CandidatePeers<T>>::try_mutate(|peers| {
+				let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+				if let Some(index) = index_option {
+					peers.remove(index);
+					return Ok(());
+				}
+				Err(())
+			}).map_err(|_| <Error<T>>::DataPeerNotExists)?;
+
+			Self::remove_data_node(bounded_cluster_id.clone());
+
+			Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_cluster_id));
+
+			Ok(())
+		}
+
+		
+		#[pallet::weight(10_000)]
+		pub fn remove_trusted_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
+			let _root = ensure_root(origin.clone())?;
+
+			let who = ensure_signed(origin)?;
+
+			let bounded_cluster_id: BoundedPeerString<T> = cluster_id.try_into().expect("cluster id is too long");
+
+			// delete peers if exists
+			<TrustedPeers<T>>::try_mutate(|peers| {
+				let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+				if let Some(index) = index_option {
+					peers.remove(index);
+					return Ok(());
+				}
+				Err(())
+			}).map_err(|_| <Error<T>>::DataPeerNotExists)?;
+
+			Self::remove_data_node(bounded_cluster_id.clone());
+
+			Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_cluster_id));
+
+			Ok(())
+		}
+
 
 		// for off-chain worker
 
@@ -393,6 +498,16 @@ pub mod pallet {
 			<PeerInfo<T>>::insert(peer_id.clone(), peer_info.clone());
 
 			Ok(peer_id.clone())
+		}
+
+		fn remove_data_node(bounded_cluster_id: BoundedPeerString<T>) -> Result<(), Error<T>>{
+
+			let peer_info = Self::peer_info(&bounded_cluster_id).ok_or(<Error<T>>::DataPeerNotExists)?;
+
+			<ProviderPeer<T>>::remove(peer_info.provider);
+
+			<PeerInfo<T>>::remove(bounded_cluster_id.clone());
+			Ok(())
 		}
 
 		fn offchain_signed_tx() -> Result<(), Error<T>> {
