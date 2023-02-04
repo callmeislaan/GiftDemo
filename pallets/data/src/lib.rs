@@ -277,8 +277,6 @@ pub mod pallet {
 		pub fn remove_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
 			let _root = ensure_root(origin.clone())?;
 
-			let who = ensure_signed(origin)?;
-
 			let bounded_cluster_id: BoundedPeerString<T> = cluster_id.try_into().expect("cluster id is too long");
 
 			// delete peers if exists
@@ -325,8 +323,6 @@ pub mod pallet {
 		#[pallet::weight(10_000)]
 		pub fn remove_trusted_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
 			let _root = ensure_root(origin.clone())?;
-
-			let who = ensure_signed(origin)?;
 
 			let bounded_cluster_id: BoundedPeerString<T> = cluster_id.try_into().expect("cluster id is too long");
 
