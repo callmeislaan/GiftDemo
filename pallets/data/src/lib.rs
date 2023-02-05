@@ -10,21 +10,23 @@ pub mod pallet {
 	pub use crate::crypto::*;
 	pub use crate::types::*;
 
+	use frame_support::ensure;
 	use frame_support::inherent::Vec;
 	use frame_support::pallet_prelude::*;
 	use frame_support::unsigned::TransactionValidity;
-	use frame_support::{ensure, Blake2_128Concat, BoundedVec};
+	use frame_support::{Blake2_128Concat, BoundedVec};
 	use frame_system as system;
 	use frame_system::offchain::{
 		AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer, SubmitTransaction,
 	};
 	use frame_system::pallet_prelude::*;
-	use serde_json::Deserializer;
+	use serde_json::{de::Read, Deserializer, StreamDeserializer};
 	use sp_core::crypto::KeyTypeId;
 	use sp_runtime::offchain::{http, Duration};
 	use sp_runtime::transaction_validity::{
 		InvalidTransaction, TransactionPriority, TransactionSource, ValidTransaction,
 	};
+	use sp_std::borrow::ToOwned;
 
 	/// Defines application identifier for crypto keys of this module.
 	///
@@ -35,20 +37,22 @@ pub mod pallet {
 	/// The keys can be inserted manually via RPC (see `author_insertKey`).
 	pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"data");
 
-	const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
-
 	pub type BoundedPeerString<T> = BoundedVec<u8, <T as Config>::PeerStringLimit>;
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> {
 		type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
 
+		#[pallet::constant]
 		type PeerStringLimit: Get<u32>;
 
+		#[pallet::constant]
 		type TrustedPeerLimit: Get<u32>;
 
+		#[pallet::constant]
 		type CandidatePeerLimit: Get<u32>;
 
+		#[pallet::constant]
 		type PeerLimit: Get<u32>;
 
 		/// The overarching dispatch call type.
@@ -103,6 +107,7 @@ pub mod pallet {
 		CandidateDataPeerRegistered(T::AccountId, BoundedPeerString<T>),
 		DataPeerUpdated(T::AccountId, BoundedPeerString<T>),
 		DataPeerRemoved(BoundedPeerString<T>),
+		DataPeerUnsignedRegistered(BoundedPeerString<T>),
 	}
 
 	#[pallet::error]
@@ -149,11 +154,24 @@ pub mod pallet {
 			log::info!("Data source: {:?}", source);
 			ensure!(source != TransactionSource::External, { InvalidTransaction::Custom(3) });
 
-			if let Call::remove_data_peer_unsigned { block_number, peers_id } = call {
-				Self::validate_transaction_parameters(block_number, peers_id)
-			} else {
-				InvalidTransaction::Call.into()
+			match call {
+				Call::remove_data_peer_unsigned { block_number, peers_id } => {
+					Self::validate_transaction_parameters(block_number, peers_id)
+				},
+				Call::remove_candidate_data_peer_unsigned { block_number, peers_id } => {
+					Self::validate_transaction_parameters(block_number, peers_id)
+				},
+				Call::register_data_peer_unsigned { block_number, peers_id } => {
+					Self::validate_transaction_parameters(block_number, peers_id)
+				},
+				_ => InvalidTransaction::Call.into(),
 			}
+
+			// if let Call::remove_data_peer_unsigned { block_number, peers_id } = call {
+			// 	Self::validate_transaction_parameters(block_number, peers_id)
+			// } else {
+			// 	InvalidTransaction::Call.into()
+			// }
 		}
 	}
 
@@ -175,7 +193,10 @@ pub mod pallet {
 			})
 			.map_err(|_| <Error<T>>::TrustedPeerLimited)?;
 
-			Self::deposit_event(<Event<T>>::TrustedDataPeerRegistered(provider, bounded_cluster_id));
+			Self::deposit_event(<Event<T>>::TrustedDataPeerRegistered(
+				provider,
+				bounded_cluster_id,
+			));
 
 			Ok(())
 		}
@@ -185,7 +206,6 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			params: PeerInfoParameters,
 		) -> DispatchResult {
-
 			let who = ensure_signed(origin)?;
 
 			let bounded_cluster_id = Self::register_data_node(who.clone(), params)?;
@@ -232,10 +252,14 @@ pub mod pallet {
 		}
 
 		#[pallet::weight(10_000)]
-		pub fn remove_provider_data_peer(origin: OriginFor<T>, provider: T::AccountId) -> DispatchResult {
+		pub fn remove_provider_data_peer(
+			origin: OriginFor<T>,
+			provider: T::AccountId,
+		) -> DispatchResult {
 			let _root = ensure_root(origin.clone())?;
 
-			let cluster_id = Self::provider_peer(&provider).ok_or(<Error<T>>::ProviderPeerNotExists)?;
+			let cluster_id =
+				Self::provider_peer(&provider).ok_or(<Error<T>>::ProviderPeerNotExists)?;
 
 			<CandidatePeers<T>>::try_mutate(|peers| {
 				let index_option = peers.iter().position(|x| *x == cluster_id.clone());
@@ -277,7 +301,8 @@ pub mod pallet {
 		pub fn remove_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
 			let _root = ensure_root(origin.clone())?;
 
-			let bounded_cluster_id: BoundedPeerString<T> = cluster_id.try_into().expect("cluster id is too long");
+			let bounded_cluster_id: BoundedPeerString<T> =
+				cluster_id.try_into().expect("cluster id is too long");
 
 			// delete peers if exists
 			<Peers<T>>::try_mutate(|peers| {
@@ -287,7 +312,8 @@ pub mod pallet {
 					return Ok(());
 				}
 				Err(())
-			}).map_err(|_| <Error<T>>::DataPeerNotExists)?;
+			})
+			.map_err(|_| <Error<T>>::DataPeerNotExists)?;
 
 			Self::remove_data_node(bounded_cluster_id.clone());
 
@@ -297,10 +323,14 @@ pub mod pallet {
 		}
 
 		#[pallet::weight(10_000)]
-		pub fn remove_candidate_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
+		pub fn remove_candidate_data_peer(
+			origin: OriginFor<T>,
+			cluster_id: Vec<u8>,
+		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 
-			let bounded_cluster_id: BoundedPeerString<T> = cluster_id.try_into().expect("cluster id is too long");
+			let bounded_cluster_id: BoundedPeerString<T> =
+				cluster_id.try_into().expect("cluster id is too long");
 
 			// delete peers if exists
 			<CandidatePeers<T>>::try_mutate(|peers| {
@@ -310,7 +340,8 @@ pub mod pallet {
 					return Ok(());
 				}
 				Err(())
-			}).map_err(|_| <Error<T>>::DataPeerNotExists)?;
+			})
+			.map_err(|_| <Error<T>>::DataPeerNotExists)?;
 
 			Self::remove_data_node(bounded_cluster_id.clone());
 
@@ -319,12 +350,15 @@ pub mod pallet {
 			Ok(())
 		}
 
-		
 		#[pallet::weight(10_000)]
-		pub fn remove_trusted_data_peer(origin: OriginFor<T>, cluster_id: Vec<u8>) -> DispatchResult {
+		pub fn remove_trusted_data_peer(
+			origin: OriginFor<T>,
+			cluster_id: Vec<u8>,
+		) -> DispatchResult {
 			let _root = ensure_root(origin.clone())?;
 
-			let bounded_cluster_id: BoundedPeerString<T> = cluster_id.try_into().expect("cluster id is too long");
+			let bounded_cluster_id: BoundedPeerString<T> =
+				cluster_id.try_into().expect("cluster id is too long");
 
 			// delete peers if exists
 			<TrustedPeers<T>>::try_mutate(|peers| {
@@ -334,7 +368,8 @@ pub mod pallet {
 					return Ok(());
 				}
 				Err(())
-			}).map_err(|_| <Error<T>>::DataPeerNotExists)?;
+			})
+			.map_err(|_| <Error<T>>::DataPeerNotExists)?;
 
 			Self::remove_data_node(bounded_cluster_id.clone());
 
@@ -343,23 +378,49 @@ pub mod pallet {
 			Ok(())
 		}
 
-
 		// for off-chain worker
 
 		#[pallet::weight(0)]
-		pub fn register_data_peer(
+		pub fn register_data_peer_unsigned(
 			origin: OriginFor<T>,
-			params: PeerInfoParameters,
+			_block_number: T::BlockNumber,
+			peers_id: Vec<Vec<u8>>,
 		) -> DispatchResult {
 			let _ = ensure_none(origin)?;
+			log::info!("Register data peer");
 
-			// let next_peer_count =
-			// Self::peer_count().checked_add(1_u32.into()).ok_or(<Error<T>>::PeerLimited)?;
-			// // increase peer count
-			// <PeerCount<T>>::put(next_peer_count);
+			for cluster_id in peers_id {
+				log::info!("peer register: {:?}", cluster_id);
+				let peers_len = Self::peers().len() as u32;
+				if peers_len >= T::PeerLimit::get() {
+					return Ok(());
+				}
 
-			// let bounded_cluster_id = Self::register_data_node(who.clone(), params)?;
-			// Self::deposit_event(<Event<T>>::DataPeerRegistered(who, bounded_cluster_id));
+				let bounded_cluster_id: BoundedPeerString<T> =
+					cluster_id.clone().try_into().expect("peer id is too long");
+
+				let peer_info =
+					Self::peer_info(&bounded_cluster_id).ok_or(<Error<T>>::DataPeerNotExists)?;
+
+				// remove candidate peer
+				<CandidatePeers<T>>::try_mutate(|peers| {
+					let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+					if let Some(index) = index_option {
+						peers.remove(index);
+						return Ok(());
+					}
+					Err(())
+				})
+				.map_err(|_| <Error<T>>::DataPeerNotExists)?;
+
+				// storage to peers
+				<Peers<T>>::try_mutate(|trusted_peers| {
+					trusted_peers.try_push(bounded_cluster_id.clone())
+				})
+				.map_err(|_| <Error<T>>::PeerLimited)?;
+
+				Self::deposit_event(<Event<T>>::DataPeerUnsignedRegistered(bounded_cluster_id));
+			}
 			Ok(())
 		}
 
@@ -370,20 +431,55 @@ pub mod pallet {
 			peers_id: Vec<Vec<u8>>,
 		) -> DispatchResult {
 			let _ = ensure_none(origin)?;
-			// for peer_id in peers_id {
+			for peer_id in peers_id {
+				let bounded_cluster_id: BoundedPeerString<T> =
+					peer_id.clone().try_into().expect("peer id is too long");
 
-			// 	let bounded_peer_id: BoundedPeerString<T> =
-			// 		peer_id.clone().try_into().expect("peer id is too long");
+				// delete peers if exists
+				<Peers<T>>::try_mutate(|peers| {
+					let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+					if let Some(index) = index_option {
+						peers.remove(index);
+						return Ok(());
+					}
+					log::error!("Data peer not exists");
+					Err(())
+				});
 
-			// 	if <PeerAccount<T>>::contains_key(bounded_peer_id.clone()) {
-			// 		if let Some(account_id) = Self::peer_account(&bounded_peer_id) {
-			// 			<ProviderPeer<T>>::remove(account_id);
-			// 		}
+				Self::remove_data_node(bounded_cluster_id.clone());
 
-			// 		<PeerAccount<T>>::remove(bounded_peer_id.clone());
-			// 		Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_peer_id));
-			// 	}
-			// }
+				Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_cluster_id));
+			}
+
+			Ok(())
+		}
+
+		#[pallet::weight(0)]
+		pub fn remove_candidate_data_peer_unsigned(
+			origin: OriginFor<T>,
+			_block_number: T::BlockNumber,
+			peers_id: Vec<Vec<u8>>,
+		) -> DispatchResult {
+			let _ = ensure_none(origin)?;
+			for peer_id in peers_id {
+				let bounded_cluster_id: BoundedPeerString<T> =
+					peer_id.clone().try_into().expect("peer id is too long");
+
+				// delete peers if exists
+				<CandidatePeers<T>>::try_mutate(|peers| {
+					let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+					if let Some(index) = index_option {
+						peers.remove(index);
+						return Ok(());
+					}
+					log::error!("Data peer not exists");
+					Err(())
+				});
+
+				Self::remove_data_node(bounded_cluster_id.clone());
+
+				Self::deposit_event(<Event<T>>::DataPeerRemoved(bounded_cluster_id));
+			}
 
 			Ok(())
 		}
@@ -429,29 +525,29 @@ pub mod pallet {
 		> {
 			let bounded_cluster_id: BoundedPeerString<T> =
 				params.cluster_id.clone().try_into().expect("cluster id is too long");
-				let mut bounded_cluster_public_address: Option<BoundedPeerString<T>> = None;
-				let mut bounded_ipfs_public_address: Option<BoundedPeerString<T>> = None;
-				if params.cluster_public_address.is_some() {
-					bounded_cluster_public_address = Some(
-						params
-							.cluster_public_address
-							.clone()
-							.unwrap()
-							.try_into()
-							.expect("cluster public address is too long"),
-					);
-				}
-	
-				if params.ipfs_public_address.is_some() {
-					bounded_ipfs_public_address = Some(
-						params
-							.ipfs_public_address
-							.clone()
-							.unwrap()
-							.try_into()
-							.expect("ipfs public address is too long"),
-					);
-				}
+			let mut bounded_cluster_public_address: Option<BoundedPeerString<T>> = None;
+			let mut bounded_ipfs_public_address: Option<BoundedPeerString<T>> = None;
+			if params.cluster_public_address.is_some() {
+				bounded_cluster_public_address = Some(
+					params
+						.cluster_public_address
+						.clone()
+						.unwrap()
+						.try_into()
+						.expect("cluster public address is too long"),
+				);
+			}
+
+			if params.ipfs_public_address.is_some() {
+				bounded_ipfs_public_address = Some(
+					params
+						.ipfs_public_address
+						.clone()
+						.unwrap()
+						.try_into()
+						.expect("ipfs public address is too long"),
+				);
+			}
 			Ok((bounded_cluster_id, bounded_cluster_public_address, bounded_ipfs_public_address))
 		}
 
@@ -496,9 +592,9 @@ pub mod pallet {
 			Ok(peer_id.clone())
 		}
 
-		fn remove_data_node(bounded_cluster_id: BoundedPeerString<T>) -> Result<(), Error<T>>{
-
-			let peer_info = Self::peer_info(&bounded_cluster_id).ok_or(<Error<T>>::DataPeerNotExists)?;
+		fn remove_data_node(bounded_cluster_id: BoundedPeerString<T>) -> Result<(), Error<T>> {
+			let peer_info =
+				Self::peer_info(&bounded_cluster_id).ok_or(<Error<T>>::DataPeerNotExists)?;
 
 			<ProviderPeer<T>>::remove(peer_info.provider);
 
@@ -507,7 +603,7 @@ pub mod pallet {
 		}
 
 		fn offchain_signed_tx() -> Result<(), Error<T>> {
-			let peers_id = Self::fetch_peers_n_remove();
+			// let peers_id = Self::fetch_peers_n_remove();
 
 			// if peers_id.len() <= 0 {
 			// 	return Ok(());
@@ -545,60 +641,204 @@ pub mod pallet {
 		}
 
 		fn offchain_unsigned_tx(block_number: T::BlockNumber) -> Result<(), Error<T>> {
-			let peers_id = Self::fetch_peers_n_remove();
+			let trusted_url_vec =
+				Self::get_trusted_url().ok_or(<Error<T>>::OffchainUnsignedTxError)?;
 
-			if peers_id.len() <= 0 {
-				return Ok(());
-			}
+			let mut peers_extend: Vec<u8> = "/peers".as_bytes().to_vec();
 
-			let call = Call::remove_data_peer_unsigned { block_number, peers_id: peers_id.clone() };
+			let trusted_url =
+				trusted_url_vec.try_mutate(|vec| vec.append(&mut peers_extend)).unwrap();
 
-			SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into()).map_err(
-				|_| {
+			// trusted_url_vec.append(&mut peers_extend);
+
+			let peers_url = sp_std::str::from_utf8(&trusted_url)
+				.map_err(|_| <Error<T>>::JsonParsingError)
+				.expect("Cannot parse json to string");
+
+			let body = Self::fetch_from_remote(&peers_url)
+				.map_err(|_| <Error<T>>::OffchainUnsignedTxError)?;
+
+			// remove peer not working
+			let peers_id_need_removed = Self::get_peers_need_move(body.clone());
+
+			if peers_id_need_removed.len() > 0 {
+				let remove_call = Call::remove_data_peer_unsigned {
+					block_number,
+					peers_id: peers_id_need_removed.clone(),
+				};
+
+				let _call_result = SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(
+					remove_call.into(),
+				)
+				.map_err(|_| {
 					log::error!("Failed in offchain_unsigned_tx");
 					<Error<T>>::OffchainUnsignedTxError
-				},
-			)
+				});
+			}
+
+			// remove candidate peer not working
+			let peers_id_need_removed = Self::get_candidate_peers_need_move(body.clone());
+
+			if peers_id_need_removed.len() > 0 {
+				let remove_call = Call::remove_candidate_data_peer_unsigned {
+					block_number,
+					peers_id: peers_id_need_removed.clone(),
+				};
+
+				let _call_result = SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(
+					remove_call.into(),
+				)
+				.map_err(|_| {
+					log::error!("Failed in offchain_unsigned_tx");
+					<Error<T>>::OffchainUnsignedTxError
+				});
+			}
+
+			// register peer if peer len lessthen peer limit
+			let peers_len = Self::peers().len() as u32;
+
+			if peers_len < T::PeerLimit::get() {
+				let peers_id_need_register = Self::get_peers_need_register(body.clone());
+
+				log::info!("Peer register count: {}", peers_id_need_register.len());
+
+				if peers_id_need_register.len() > 0 {
+					let register_call = Call::register_data_peer_unsigned {
+						block_number,
+						peers_id: peers_id_need_register.clone(),
+					};
+
+					let _call_result =
+						SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(
+							register_call.into(),
+						)
+						.map_err(|_| {
+							log::error!("Failed in offchain_unsigned_tx");
+							<Error<T>>::OffchainUnsignedTxError
+						});
+				}
+			}
+			Ok(())
 		}
 
-		pub fn fetch_peers_n_remove() -> Vec<Vec<u8>> {
-			// let PEERS_URI = "http://localhost:9094/peers";
+		pub fn get_trusted_url() -> Option<BoundedPeerString<T>> {
+			// http://localhost:9094/peers
 
-			// let body = Self::fetch_from_remote(PEERS_URI).expect("Cannot fetch data");
+			let trusted_peers = Self::trusted_peers();
 
-			// let body_str = sp_std::str::from_utf8(&body)
-			// 	.map_err(|_| <Error<T>>::JsonParsingError)
-			// 	.expect("Cannot parse json to string");
+			if trusted_peers.len() == 0 {
+				return None;
+			}
 
-			// // log::info!("{}", body_str);
+			let mut peer_uri = None;
 
-			// let stream = Deserializer::from_str(body_str).into_iter::<Option<Peer>>();
+			for cluster_id in trusted_peers.iter() {
+				let peer_info = Self::peer_info(cluster_id.clone()).unwrap();
+				let peer_uri_option = peer_info.clone().cluster_public_address;
+				if let Some(peer_uri_unwrap) = peer_uri_option {
+					peer_uri = Some(peer_uri_unwrap);
+					break;
+				}
+			}
+			peer_uri
+		}
 
-			// let mut peers_id: Vec<Vec<u8>> = Vec::new();
-			// let peer_account = <PeerAccount<T>>::iter();
+		// get all peers from trusted node and remove off-line nodes
+		pub fn get_peers_need_move(body: Vec<u8>) -> Vec<Vec<u8>> {
+			let body_str = sp_std::str::from_utf8(&body)
+				.map_err(|_| <Error<T>>::JsonParsingError)
+				.expect("Cannot parse json to string");
+
+			if body_str == "" {
+				return Vec::new();
+			}
+
+			let stream = Deserializer::from_str(body_str).into_iter::<Option<Peer>>();
+
+			let mut peers_id: Vec<Vec<u8>> = Vec::new();
+			let peers = Self::peers();
 			let mut peers_need_remove: Vec<Vec<u8>> = Vec::new();
 
-			// for peer_wrap in stream {
-			// 	if let Some(peer) = peer_wrap.unwrap() {
-			// 		peers_id.push(peer.id);
-			// 	}
-			// }
+			for peer_wrap in stream {
+				if let Some(peer) = peer_wrap.unwrap() {
+					peers_id.push(peer.id);
+				}
+			}
 
-			// for (peer_id, _) in peer_account {
-			// 	if !peers_id.contains(&peer_id) {
-			// 		log::info!("peer id removed: {:?}", peer_id);
-			// 		peers_need_remove.push(peer_id.into());
-			// 	}
-			// }
+			for peer_id in peers {
+				if !peers_id.contains(&peer_id) {
+					log::info!("peer id removed: {:?}", peer_id);
+					peers_need_remove.push(peer_id.into());
+				}
+			}
 
 			peers_need_remove
+		}
+
+		// get all peers from trusted node and remove off-line nodes
+		pub fn get_candidate_peers_need_move(body: Vec<u8>) -> Vec<Vec<u8>> {
+			let body_str = sp_std::str::from_utf8(&body)
+				.map_err(|_| <Error<T>>::JsonParsingError)
+				.expect("Cannot parse json to string");
+
+			if body_str == "" {
+				return Vec::new();
+			}
+
+			let stream = Deserializer::from_str(body_str).into_iter::<Option<Peer>>();
+
+			let mut peers_id: Vec<Vec<u8>> = Vec::new();
+			let peers = Self::candidate_peers();
+			let mut peers_need_remove: Vec<Vec<u8>> = Vec::new();
+
+			for peer_wrap in stream {
+				if let Some(peer) = peer_wrap.unwrap() {
+					peers_id.push(peer.id);
+				}
+			}
+
+			for peer_id in peers {
+				if !peers_id.contains(&peer_id) {
+					log::info!("peer id removed: {:?}", peer_id);
+					peers_need_remove.push(peer_id.into());
+				}
+			}
+
+			peers_need_remove
+		}
+
+		pub fn get_peers_need_register(body: Vec<u8>) -> Vec<Vec<u8>> {
+			let body_str = sp_std::str::from_utf8(&body)
+				.map_err(|_| <Error<T>>::JsonParsingError)
+				.expect("Cannot parse json to string");
+
+			if body_str == "" {
+				return Vec::new();
+			}
+
+			let stream = Deserializer::from_str(body_str).into_iter::<Option<Peer>>();
+
+			let candidate_peers = Self::candidate_peers();
+			let mut peers_need_register: Vec<Vec<u8>> = Vec::new();
+
+			for peer_wrap in stream {
+				if let Some(peer) = peer_wrap.unwrap() {
+					let peer_id_vec = peer.id;
+					let bounded_peer_id: BoundedPeerString<T> =
+						peer_id_vec.clone().try_into().expect("peer id too long");
+					if candidate_peers.contains(&bounded_peer_id) {
+						peers_need_register.push(peer_id_vec);
+					}
+				}
+			}
+
+			peers_need_register
 		}
 
 		pub fn fetch_from_remote(server: &str) -> Result<Vec<u8>, Error<T>> {
 			let request = http::Request::get(server);
 
-			let timeout =
-				sp_io::offchain::timestamp().add(Duration::from_millis(FETCH_TIMEOUT_PERIOD));
+			let timeout = sp_io::offchain::timestamp().add(Duration::from_millis(3000));
 
 			let pending =
 				request.deadline(timeout).send().map_err(|e| <Error<T>>::HttpFetchingError)?;
