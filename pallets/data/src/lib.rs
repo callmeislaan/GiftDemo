@@ -17,16 +17,15 @@ pub mod pallet {
 	use frame_support::{Blake2_128Concat, BoundedVec};
 	use frame_system as system;
 	use frame_system::offchain::{
-		AppCrypto, CreateSignedTransaction, SendSignedTransaction, Signer, SubmitTransaction,
+		AppCrypto, CreateSignedTransaction, SubmitTransaction, 
 	};
 	use frame_system::pallet_prelude::*;
-	use serde_json::{de::Read, Deserializer, StreamDeserializer};
+	use serde_json::Deserializer;
 	use sp_core::crypto::KeyTypeId;
 	use sp_runtime::offchain::{http, Duration};
 	use sp_runtime::transaction_validity::{
-		InvalidTransaction, TransactionPriority, TransactionSource, ValidTransaction,
+		InvalidTransaction, TransactionPriority, TransactionSource, ValidTransaction, 
 	};
-	use sp_std::borrow::ToOwned;
 
 	/// Defines application identifier for crypto keys of this module.
 	///
@@ -135,7 +134,7 @@ pub mod pallet {
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn offchain_worker(block_number: T::BlockNumber) {
 			log::info!("Hello from pallet-ocw.");
-			Self::offchain_unsigned_tx(block_number);
+			let _result = Self::offchain_unsigned_tx(block_number);
 		}
 	}
 
@@ -166,12 +165,6 @@ pub mod pallet {
 				},
 				_ => InvalidTransaction::Call.into(),
 			}
-
-			// if let Call::remove_data_peer_unsigned { block_number, peers_id } = call {
-			// 	Self::validate_transaction_parameters(block_number, peers_id)
-			// } else {
-			// 	InvalidTransaction::Call.into()
-			// }
 		}
 	}
 
@@ -261,7 +254,7 @@ pub mod pallet {
 			let cluster_id =
 				Self::provider_peer(&provider).ok_or(<Error<T>>::ProviderPeerNotExists)?;
 
-			<CandidatePeers<T>>::try_mutate(|peers| {
+			let _result = <CandidatePeers<T>>::try_mutate(|peers| {
 				let index_option = peers.iter().position(|x| *x == cluster_id.clone());
 				if let Some(index) = index_option {
 					peers.remove(index);
@@ -270,7 +263,7 @@ pub mod pallet {
 				Err(())
 			});
 
-			<Peers<T>>::try_mutate(|peers| {
+			let _result = <Peers<T>>::try_mutate(|peers| {
 				let index_option = peers.iter().position(|x| *x == cluster_id.clone());
 				if let Some(index) = index_option {
 					peers.remove(index);
@@ -279,7 +272,7 @@ pub mod pallet {
 				Err(())
 			});
 
-			<TrustedPeers<T>>::try_mutate(|peers| {
+			let _result = <TrustedPeers<T>>::try_mutate(|peers| {
 				let index_option = peers.iter().position(|x| *x == cluster_id.clone());
 				if let Some(index) = index_option {
 					peers.remove(index);
@@ -436,7 +429,7 @@ pub mod pallet {
 					peer_id.clone().try_into().expect("peer id is too long");
 
 				// delete peers if exists
-				<Peers<T>>::try_mutate(|peers| {
+				let _result = <Peers<T>>::try_mutate(|peers| {
 					let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
 					if let Some(index) = index_option {
 						peers.remove(index);
@@ -466,7 +459,7 @@ pub mod pallet {
 					peer_id.clone().try_into().expect("peer id is too long");
 
 				// delete peers if exists
-				<CandidatePeers<T>>::try_mutate(|peers| {
+				let _result = <CandidatePeers<T>>::try_mutate(|peers| {
 					let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
 					if let Some(index) = index_option {
 						peers.remove(index);
@@ -855,7 +848,7 @@ pub mod pallet {
 
 		fn validate_transaction_parameters(
 			block_number: &T::BlockNumber,
-			peers_id: &Vec<Vec<u8>>,
+			_peers_id: &Vec<Vec<u8>>,
 		) -> TransactionValidity {
 			log::info!("Validate transaction parameters");
 
