@@ -14,17 +14,16 @@ pub mod pallet {
 	use frame_support::inherent::Vec;
 	use frame_support::pallet_prelude::*;
 	use frame_support::unsigned::TransactionValidity;
+	use frame_support::weights::Weight;
 	use frame_support::{Blake2_128Concat, BoundedVec};
 	use frame_system as system;
-	use frame_system::offchain::{
-		AppCrypto, CreateSignedTransaction, SubmitTransaction, 
-	};
+	use frame_system::offchain::{AppCrypto, CreateSignedTransaction, SubmitTransaction};
 	use frame_system::pallet_prelude::*;
 	use serde_json::Deserializer;
 	use sp_core::crypto::KeyTypeId;
 	use sp_runtime::offchain::{http, Duration};
 	use sp_runtime::transaction_validity::{
-		InvalidTransaction, TransactionPriority, TransactionSource, ValidTransaction, 
+		InvalidTransaction, TransactionPriority, TransactionSource, ValidTransaction,
 	};
 
 	/// Defines application identifier for crypto keys of this module.
@@ -82,7 +81,7 @@ pub mod pallet {
 	#[pallet::storage]
 	#[pallet::getter(fn candidate_peers)]
 	pub type CandidatePeers<T: Config> =
-		StorageValue<_, BoundedVec<BoundedPeerString<T>, T::CandidatePeerLimit>, ValueQuery>;
+		StorageValue<_, BoundedVec<ProofOfOnline<T>, T::CandidatePeerLimit>, ValueQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn trusted_peers)]
@@ -107,6 +106,7 @@ pub mod pallet {
 		DataPeerUpdated(T::AccountId, BoundedPeerString<T>),
 		DataPeerRemoved(BoundedPeerString<T>),
 		DataPeerUnsignedRegistered(BoundedPeerString<T>),
+		CandidateDataPeerProofIncreated(T::BlockNumber),
 	}
 
 	#[pallet::error]
@@ -203,9 +203,12 @@ pub mod pallet {
 
 			let bounded_cluster_id = Self::register_data_node(who.clone(), params)?;
 
+			let proof_of_online =
+				ProofOfOnline { cluster_id: bounded_cluster_id.clone(), proof: 0_u32 };
+
 			// storage to candidate peers
 			<CandidatePeers<T>>::try_mutate(|candidate_peers| {
-				candidate_peers.try_push(bounded_cluster_id.clone())
+				candidate_peers.try_push(proof_of_online.clone())
 			})
 			.map_err(|_| <Error<T>>::CandidatePeerLimited)?;
 
@@ -255,7 +258,8 @@ pub mod pallet {
 				Self::provider_peer(&provider).ok_or(<Error<T>>::ProviderPeerNotExists)?;
 
 			let _result = <CandidatePeers<T>>::try_mutate(|peers| {
-				let index_option = peers.iter().position(|x| *x == cluster_id.clone());
+				let index_option =
+					peers.iter().position(|x| x.clone().cluster_id == cluster_id.clone());
 				if let Some(index) = index_option {
 					peers.remove(index);
 					return Ok(());
@@ -327,7 +331,8 @@ pub mod pallet {
 
 			// delete peers if exists
 			<CandidatePeers<T>>::try_mutate(|peers| {
-				let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+				let index_option =
+					peers.iter().position(|x| x.clone().cluster_id == bounded_cluster_id.clone());
 				if let Some(index) = index_option {
 					peers.remove(index);
 					return Ok(());
@@ -397,7 +402,9 @@ pub mod pallet {
 
 				// remove candidate peer
 				<CandidatePeers<T>>::try_mutate(|peers| {
-					let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+					let index_option = peers
+						.iter()
+						.position(|x| x.clone().cluster_id == bounded_cluster_id.clone());
 					if let Some(index) = index_option {
 						peers.remove(index);
 						return Ok(());
@@ -460,7 +467,9 @@ pub mod pallet {
 
 				// delete peers if exists
 				let _result = <CandidatePeers<T>>::try_mutate(|peers| {
-					let index_option = peers.iter().position(|x| *x == bounded_cluster_id.clone());
+					let index_option = peers
+						.iter()
+						.position(|x| x.clone().cluster_id == bounded_cluster_id.clone());
 					if let Some(index) = index_option {
 						peers.remove(index);
 						return Ok(());
@@ -476,6 +485,25 @@ pub mod pallet {
 
 			Ok(())
 		}
+
+		#[pallet::weight(0)]
+		pub fn increase_candidate_data_peer_proof_unsigned(
+			origin: OriginFor<T>,
+			block_number: T::BlockNumber,
+		) -> DispatchResult {
+			let _ = ensure_none(origin)?;
+			
+			<CandidatePeers<T>>::try_mutate(|candidate_peer_vec| {
+				for candidate_peer in candidate_peer_vec.into_iter() {
+					candidate_peer.proof = candidate_peer.proof + 1;
+				}
+				Ok(())
+			}).map_err(|_: Error<T>| <Error<T>>::DataPeerNotExists)?;
+
+			Self::deposit_event(<Event<T>>::CandidateDataPeerProofIncreated(block_number));
+			Ok(())
+		}
+
 	}
 
 	impl<T: Config> Pallet<T> {
@@ -642,8 +670,6 @@ pub mod pallet {
 			let trusted_url =
 				trusted_url_vec.try_mutate(|vec| vec.append(&mut peers_extend)).unwrap();
 
-			// trusted_url_vec.append(&mut peers_extend);
-
 			let peers_url = sp_std::str::from_utf8(&trusted_url)
 				.map_err(|_| <Error<T>>::JsonParsingError)
 				.expect("Cannot parse json to string");
@@ -711,6 +737,20 @@ pub mod pallet {
 						});
 				}
 			}
+
+			// increase candidate proof of online
+
+			let increase_candidate_proof_call = Call::increase_candidate_data_peer_proof_unsigned {
+				block_number,
+			};
+
+			let _call_result =
+				SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(increase_candidate_proof_call.into())
+					.map_err(|_| {
+						log::error!("Failed in offchain_unsigned_tx");
+						<Error<T>>::OffchainUnsignedTxError
+					});
+
 			Ok(())
 		}
 
@@ -781,7 +821,7 @@ pub mod pallet {
 			let stream = Deserializer::from_str(body_str).into_iter::<Option<Peer>>();
 
 			let mut peers_id: Vec<Vec<u8>> = Vec::new();
-			let peers = Self::candidate_peers();
+			let candidate_peers = Self::candidate_peers();
 			let mut peers_need_remove: Vec<Vec<u8>> = Vec::new();
 
 			for peer_wrap in stream {
@@ -790,7 +830,8 @@ pub mod pallet {
 				}
 			}
 
-			for peer_id in peers {
+			for candidate_peer in candidate_peers {
+				let peer_id = candidate_peer.cluster_id;
 				if !peers_id.contains(&peer_id) {
 					log::info!("peer id removed: {:?}", peer_id);
 					peers_need_remove.push(peer_id.into());
@@ -811,7 +852,10 @@ pub mod pallet {
 
 			let stream = Deserializer::from_str(body_str).into_iter::<Option<Peer>>();
 
-			let candidate_peers = Self::candidate_peers();
+			let candidate_peers_id: Vec<BoundedPeerString<T>> = Self::candidate_peers()
+				.into_iter()
+				.map(|candidate_peer| candidate_peer.cluster_id)
+				.collect();
 			let mut peers_need_register: Vec<Vec<u8>> = Vec::new();
 
 			for peer_wrap in stream {
@@ -819,7 +863,7 @@ pub mod pallet {
 					let peer_id_vec = peer.id;
 					let bounded_peer_id: BoundedPeerString<T> =
 						peer_id_vec.clone().try_into().expect("peer id too long");
-					if candidate_peers.contains(&bounded_peer_id) {
+					if candidate_peers_id.contains(&bounded_peer_id) {
 						peers_need_register.push(peer_id_vec);
 					}
 				}

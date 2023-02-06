@@ -7,9 +7,15 @@ use crate::*;
 
 #[derive(Clone, Encode, Decode, TypeInfo, MaxEncodedLen)]
 #[scale_info(skip_type_params(T))]
+pub struct ProofOfOnline<T: Config> {
+	pub cluster_id: BoundedPeerString<T>,
+	pub proof: u32,
+}
+
+#[derive(Clone, Encode, Decode, TypeInfo, MaxEncodedLen)]
+#[scale_info(skip_type_params(T))]
 pub struct OnChainPeerInfo<T: Config> {
 	pub cluster_id: BoundedPeerString<T>,
-	// pub ipfs_id: BoundedPeerString<T>,
 	pub cluster_public_address: Option<BoundedPeerString<T>>,
 	pub ipfs_public_address: Option<BoundedPeerString<T>>,
 	pub create_at: T::BlockNumber,
