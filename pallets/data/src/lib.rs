@@ -384,8 +384,8 @@ pub mod pallet {
 
 			for cluster_id in peers_id {
 				log::info!("peer register: {:?}", cluster_id);
-				let peers_len = Self::peers().len() as u32;
-				if peers_len >= T::PeerLimit::get() {
+				let peers_len = Self::peers().len();
+				if peers_len >= Self::peers().capacity() {
 					return Ok(());
 				}
 
@@ -688,9 +688,9 @@ pub mod pallet {
 			}
 
 			// register peer if peer len lessthen peer limit
-			let peers_len = Self::peers().len() as u32;
+			let peers_len = Self::peers().len();
 
-			if peers_len < T::PeerLimit::get() {
+			if peers_len < Self::peers().capacity() {
 				let peers_id_need_register = Self::get_peers_need_register(body.clone());
 
 				log::info!("Peer register count: {}", peers_id_need_register.len());
